@@ -65,6 +65,14 @@ def run(ctx: VideoContext) -> VideoContext:
         cached = _load_cached(ctx)
         if cached is not None:
             ctx.chunks = cached
+            meta = _load_meta(ctx) or {}
+            fallback_used = bool(meta.get("fallback_used", False))
+            ctx.runtime_flags["chunking_fallback_used"] = fallback_used
+            _raise_if_strict_fallback(
+                ctx,
+                fallback_used,
+                meta.get("fallback_reason"),
+            )
             logger.info("Stage 4: skipped (checkpoint exists)")
             return ctx
 
@@ -74,7 +82,7 @@ def run(ctx: VideoContext) -> VideoContext:
     logger.info("Stage 4: Semantic chunking with LLM ...")
     t0 = time.time()
 
-    chunks = _chunk_with_llm(
+    chunks, fallback_used = _chunk_with_llm(
         merged_transcript=ctx.merged_transcript,
         scene_boundaries=ctx.scene_boundaries or [],
         model=ctx.config.chunking_model,
@@ -85,6 +93,18 @@ def run(ctx: VideoContext) -> VideoContext:
     ctx.chunks = chunks
     out_path = ctx.debug_dir / "chunk_manifest.json"
     out_path.write_text(json.dumps(chunks, indent=2, ensure_ascii=False))
+    _save_meta(
+        ctx=ctx,
+        data={
+            "fallback_used": fallback_used,
+            "fallback_reason": (
+                "chunking_llm_unavailable_or_unparseable" if fallback_used else None
+            ),
+            "chunk_count": len(chunks),
+        },
+    )
+    ctx.runtime_flags["chunking_fallback_used"] = fallback_used
+    _raise_if_strict_fallback(ctx, fallback_used, None)
 
     elapsed = time.time() - t0
     logger.info(
@@ -107,7 +127,7 @@ def _chunk_with_llm(
     model: str,
     min_duration: float,
     max_duration: float,
-) -> list[dict]:
+) -> tuple[list[dict], bool]:
     """
     Send transcript to Ollama LLM for semantic chunking.
 
@@ -127,7 +147,7 @@ def _chunk_with_llm(
     max_segments_per_call = 1200
 
     if len(merged_transcript) <= max_segments_per_call:
-        chunks = _single_pass_chunk(
+        chunks, fallback_used = _single_pass_chunk(
             transcript_text,
             model,
             fallback_start=0.0,
@@ -135,7 +155,7 @@ def _chunk_with_llm(
         )
     else:
         # Multi-pass for very long transcripts
-        chunks = _multi_pass_chunk(
+        chunks, fallback_used = _multi_pass_chunk(
             merged_transcript, scene_boundaries, model,
             max_segments_per_call, min_duration, max_duration, actual_end,
         )
@@ -143,7 +163,7 @@ def _chunk_with_llm(
     # Post-parse validation: enforce continuity and duration constraints
     chunks = _validate_chunks(chunks, actual_end, min_duration, max_duration)
 
-    return chunks
+    return chunks, fallback_used
 
 
 def _format_transcript_for_llm(
@@ -188,7 +208,7 @@ def _single_pass_chunk(
     model: str,
     fallback_start: float,
     fallback_end: float,
-) -> list[dict]:
+) -> tuple[list[dict], bool]:
     """Send entire transcript to LLM in one pass."""
     prompt = (
         f"{CHUNKING_SYSTEM_PROMPT}\n\n"
@@ -206,10 +226,12 @@ def _single_pass_chunk(
             options={"temperature": 0.3, "num_predict": 4096},
         )
         text = response["message"]["content"]
-        return _parse_chunks_json(text, fallback_start, fallback_end)
+        chunks = _parse_chunks_json(text, fallback_start, fallback_end)
+        fallback_used = _contains_fallback_chunk(chunks)
+        return chunks, fallback_used
     except Exception as exc:
         logger.warning("  LLM chunking unavailable (%s); using fallback chunk.", exc)
-        return _fallback_chunks(fallback_start, fallback_end)
+        return _fallback_chunks(fallback_start, fallback_end), True
 
 
 def _multi_pass_chunk(
@@ -220,10 +242,11 @@ def _multi_pass_chunk(
     min_duration: float,
     max_duration: float,
     actual_end: float,
-) -> list[dict]:
+) -> tuple[list[dict], bool]:
     """Chunk long transcripts in overlapping windows."""
     all_chunks: list[dict] = []
     chunk_id_offset = 0
+    fallback_used = False
 
     for i in range(0, len(segments), window_size - 100):  # 100-segment overlap
         window = segments[i:i + window_size]
@@ -240,12 +263,13 @@ def _multi_pass_chunk(
         ]
 
         text = _format_transcript_for_llm(window, window_scenes)
-        chunks = _single_pass_chunk(
+        chunks, chunk_fallback = _single_pass_chunk(
             text,
             model,
             fallback_start=window_start,
             fallback_end=window_end,
         )
+        fallback_used = fallback_used or chunk_fallback
 
         # Re-number and add
         for c in chunks:
@@ -254,7 +278,7 @@ def _multi_pass_chunk(
         chunk_id_offset += len(chunks)
 
     # Deduplicate overlapping chunks
-    return _deduplicate_chunks(all_chunks)
+    return _deduplicate_chunks(all_chunks), fallback_used
 
 
 def _deduplicate_chunks(chunks: list[dict]) -> list[dict]:
@@ -320,6 +344,16 @@ def _fallback_chunks(fallback_start: float, fallback_end: float) -> list[dict]:
         "title": "Full segment (LLM chunking failed)",
         "reason": "Fallback — LLM output was not parseable",
     }]
+
+
+def _contains_fallback_chunk(chunks: list[dict]) -> bool:
+    """Detect whether the returned chunk set came from fallback logic."""
+    for chunk in chunks:
+        reason = str(chunk.get("reason", "")).lower()
+        title = str(chunk.get("title", "")).lower()
+        if "fallback" in reason or "llm chunking failed" in title:
+            return True
+    return False
 
 
 def _validate_chunks(
@@ -420,3 +454,40 @@ def _load_cached(ctx: VideoContext) -> list[dict] | None:
         if path.exists():
             return json.loads(path.read_text())
     return None
+
+
+def _save_meta(ctx: VideoContext, data: dict) -> None:
+    """Persist chunking execution metadata."""
+    meta_path = ctx.debug_dir / "chunking_meta.json"
+    meta_path.write_text(json.dumps(data, indent=2))
+
+
+def _load_meta(ctx: VideoContext) -> dict | None:
+    """Load chunking metadata if present."""
+    meta_path = ctx.debug_dir / "chunking_meta.json"
+    if not meta_path.exists():
+        return None
+    try:
+        return json.loads(meta_path.read_text())
+    except json.JSONDecodeError:
+        return None
+
+
+def _raise_if_strict_fallback(
+    ctx: VideoContext,
+    fallback_used: bool,
+    fallback_reason: str | None,
+) -> None:
+    """Fail fast in strict mode if chunking fallback was used."""
+    if not fallback_used:
+        return
+    if not (
+        ctx.config.strict_production_checks
+        and ctx.config.fail_on_chunking_fallback
+    ):
+        return
+    reason = fallback_reason or "LLM unavailable or output not parseable"
+    raise RuntimeError(
+        "Strict mode: chunking fallback was used. "
+        f"Fix local LLM/model and rerun. Reason: {reason}"
+    )

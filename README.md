@@ -13,8 +13,10 @@ Local-first pipeline to ingest YouTube videos and generate structured chunk repo
 - `run_youtube.py` - top-level YouTube URL -> full report
 - `run.py` - run pipeline on an existing local video directory
 - `prepare_sample.py` - create a 1-hour sample dataset
+- `scripts/refresh_stage7_reports.py` - refresh only Stage 7 for existing outputs
 - `stages/` - pipeline stage implementations
 - `utils/` - VTT parsing and helper utilities
+- `PROJECT_OVERVIEW.md` - high-level architecture and execution flow
 
 ## Prerequisites
 
@@ -50,6 +52,12 @@ python run_youtube.py \
   --chunking-model llama3.2:latest
 ```
 
+Strict production checks are ON by default. The run fails if:
+
+- diarization falls back to single-speaker mode
+- chunking falls back to synthetic single-chunk output
+- final quality gate fails
+
 By default, YouTube download uses highest quality format selection:
 
 - `--ytdlp-format "bv*+ba/b"` (best video + best audio, then fallback)
@@ -80,6 +88,7 @@ Per video, outputs are written to:
 - `<video_dir>/analysis/video_report.json` (main consolidated output)
 - `<video_dir>/analysis/faces/` (exported face crops grouped by person)
 - `<video_dir>/analysis/debug/` (all intermediate artifacts/checkpoints)
+- `<video_dir>/analysis/debug/quality_gate.json` (pass/fail quality validation)
 
 ## Pipeline Stages
 
@@ -101,9 +110,20 @@ Per video, outputs are written to:
 - `--verbose` - enable debug logs
 - `--download-only` - download YouTube assets and stop before analysis
 - `--ytdlp-format "<selector>"` - override yt-dlp quality selector
+- `--allow-fallbacks` - disable strict failure on fallback behavior
+- `--skip-quality-gate` - skip final quality gate
+- `--retranscribe-mode always|sparse` - low-quality retranscription policy
+
+## Refresh Existing Reports
+
+Use this to re-run only Stage 7 for already-processed videos (for example after
+location extraction improvements):
+
+```bash
+python scripts/refresh_stage7_reports.py --root playlist_downloads --allow-fallbacks
+```
 
 ## Notes
 
-- If `HF_TOKEN` is missing, diarization falls back to a single-speaker timeline.
-- If `norfair` is unavailable, Stage 5 uses an embedding-only tracking fallback.
-- If Ollama/model is unavailable, chunking/summaries fall back gracefully.
+- In strict mode (default), fallback behavior becomes a hard failure.
+- Use `--allow-fallbacks` for legacy/backfill runs where partial output is acceptable.

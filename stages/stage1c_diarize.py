@@ -25,12 +25,18 @@ def run(ctx: VideoContext) -> VideoContext:
         cached = _load_cached(ctx)
         if cached is not None:
             ctx.diarization_segments = cached
+            meta = _load_meta(ctx) or {}
+            fallback_used = bool(meta.get("fallback_used", False))
+            ctx.runtime_flags["diarization_fallback_used"] = fallback_used
+            _raise_if_strict_fallback(ctx, fallback_used, meta.get("fallback_reason"))
             logger.info("Stage 1c: skipped (checkpoint exists)")
             return ctx
 
     audio_path = ctx.audio_clean_path or ctx.audio_path
     logger.info(f"Stage 1c: Diarizing with pyannote from {audio_path.name} ...")
     t0 = time.time()
+    fallback_used = False
+    fallback_reason: str | None = None
 
     try:
         segments = _diarize(
@@ -45,11 +51,24 @@ def run(ctx: VideoContext) -> VideoContext:
             "Using single-speaker timeline.",
             exc,
         )
+        fallback_used = True
+        fallback_reason = str(exc)
         segments = _fallback_diarization(ctx)
 
     ctx.diarization_segments = segments
     out_path = ctx.debug_dir / "diarization.json"
     out_path.write_text(json.dumps(segments, indent=2))
+    _save_meta(
+        ctx=ctx,
+        data={
+            "fallback_used": fallback_used,
+            "fallback_reason": fallback_reason,
+            "segment_count": len(segments),
+            "speaker_count": len({s["speaker"] for s in segments}),
+        },
+    )
+    ctx.runtime_flags["diarization_fallback_used"] = fallback_used
+    _raise_if_strict_fallback(ctx, fallback_used, fallback_reason)
 
     # Log summary
     speakers = set(s["speaker"] for s in segments)
@@ -147,6 +166,43 @@ def _load_cached(ctx: VideoContext) -> list[dict] | None:
         if path.exists():
             return json.loads(path.read_text())
     return None
+
+
+def _save_meta(ctx: VideoContext, data: dict) -> None:
+    """Persist diarization execution metadata."""
+    meta_path = ctx.debug_dir / "diarization_meta.json"
+    meta_path.write_text(json.dumps(data, indent=2))
+
+
+def _load_meta(ctx: VideoContext) -> dict | None:
+    """Load diarization metadata if present."""
+    meta_path = ctx.debug_dir / "diarization_meta.json"
+    if not meta_path.exists():
+        return None
+    try:
+        return json.loads(meta_path.read_text())
+    except json.JSONDecodeError:
+        return None
+
+
+def _raise_if_strict_fallback(
+    ctx: VideoContext,
+    fallback_used: bool,
+    fallback_reason: str | None,
+) -> None:
+    """Fail fast in strict mode if diarization fallback was used."""
+    if not fallback_used:
+        return
+    if not (
+        ctx.config.strict_production_checks
+        and ctx.config.fail_on_diarization_fallback
+    ):
+        return
+    reason = fallback_reason or "unknown reason"
+    raise RuntimeError(
+        "Strict mode: diarization fallback was used. "
+        f"Fix diarization dependencies/token and rerun. Reason: {reason}"
+    )
 
 
 def _fallback_diarization(ctx: VideoContext) -> list[dict]:

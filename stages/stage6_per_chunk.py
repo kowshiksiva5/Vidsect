@@ -146,18 +146,25 @@ def _prepare_chunk(
     quality = assess_vtt_quality(vtt_cues, start_sec, end_sec)
     sliced_word_count = sum(len(s.get("text", "").split()) for s in sliced)
     sparse_slice = sliced_word_count < 20
-    needs_retranscribe = (
-        quality.score < ctx.config.retranscribe_if_quality_below and sparse_slice
+    low_quality = quality.score < ctx.config.retranscribe_if_quality_below
+    needs_retranscribe = low_quality and (
+        ctx.config.retranscribe_low_quality_all_chunks or sparse_slice
     )
 
     quality_info = {
         "score": quality.score,
         "issues": quality.issues,
+        "low_quality": low_quality,
         "needs_retranscription": needs_retranscribe,
         "text_cues": quality.text_cues,
         "music_cues": quality.music_cues,
         "sliced_word_count": sliced_word_count,
         "sparse_slice": sparse_slice,
+        "retranscription_policy": (
+            "always_low_quality"
+            if ctx.config.retranscribe_low_quality_all_chunks
+            else "low_quality_sparse_only"
+        ),
     }
 
     # 3. Selective Whisper re-transcription for low-quality chunks
@@ -188,10 +195,7 @@ def _prepare_chunk(
                 "    ✗ Re-transcription failed; using sliced transcript"
             )
     else:
-        if (
-            quality.score < ctx.config.retranscribe_if_quality_below
-            and not sparse_slice
-        ):
+        if low_quality and not sparse_slice:
             logger.info(
                 "    ✓ Re-transcription skipped: low VTT quality (%.2f) but "
                 "sliced transcript is dense (%d words)",
@@ -201,6 +205,7 @@ def _prepare_chunk(
             quality_info["retranscription_status"] = "skipped_sliced_dense"
         else:
             logger.info(f"    ✓ VTT quality OK ({quality.score:.2f})")
+            quality_info["retranscription_status"] = "not_needed"
 
     # Persist transcript
     transcript_path = chunk_dir / "transcript.json"

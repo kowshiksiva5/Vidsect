@@ -113,6 +113,28 @@ Examples:
             "Default (bv*+ba/b) downloads highest quality video+audio."
         ),
     )
+    parser.add_argument(
+        "--allow-fallbacks",
+        action="store_true",
+        help=(
+            "Allow fallback outputs (single-speaker diarization / fallback chunking) "
+            "instead of failing in strict mode."
+        ),
+    )
+    parser.add_argument(
+        "--skip-quality-gate",
+        action="store_true",
+        help="Skip final quality gate checks and quality_gate.json generation.",
+    )
+    parser.add_argument(
+        "--retranscribe-mode",
+        choices=["always", "sparse"],
+        default="always",
+        help=(
+            "Low-quality VTT retranscription policy: "
+            "'always' (recommended) or 'sparse' (only sparse low-quality chunks)."
+        ),
+    )
 
     args = parser.parse_args()
     setup_logging(args.verbose)
@@ -145,6 +167,9 @@ Examples:
         denoise_beta=args.denoise_beta,
         whisper_model=args.whisper_model,
         chunking_model=args.chunking_model,
+        strict_production_checks=not args.allow_fallbacks,
+        run_quality_gate=not args.skip_quality_gate,
+        retranscribe_low_quality_all_chunks=(args.retranscribe_mode == "always"),
     )
 
     ctx = run_pipeline(

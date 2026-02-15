@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 
 @dataclass
@@ -49,6 +49,13 @@ class PipelineConfig:
 
     # --- Selective Whisper re-transcription ---
     retranscribe_if_quality_below: float = 0.4  # 0-1 quality score
+    retranscribe_low_quality_all_chunks: bool = True
+
+    # --- Reliability / quality gates ---
+    strict_production_checks: bool = True
+    run_quality_gate: bool = True
+    fail_on_diarization_fallback: bool = True
+    fail_on_chunking_fallback: bool = True
 
     # --- Adaptive face sampling ---
     face_sample_adaptive_threshold_sec: float = 3600.0  # Double interval above this
@@ -107,6 +114,9 @@ class VideoContext:
     face_gallery: dict | None = field(default=None)
     person_identities: dict | None = field(default=None)
     speaker_mapping: dict | None = field(default=None)
+
+    # --- Runtime state ---
+    runtime_flags: dict[str, Any] = field(default_factory=dict)
 
     # --- Config ---
     config: PipelineConfig = field(default_factory=PipelineConfig)
