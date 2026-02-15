@@ -105,6 +105,14 @@ Examples:
         action="store_true",
         help="Only download/prepare inputs, do not run pipeline",
     )
+    parser.add_argument(
+        "--ytdlp-format",
+        default="bv*+ba/b",
+        help=(
+            "yt-dlp format selector. "
+            "Default (bv*+ba/b) downloads highest quality video+audio."
+        ),
+    )
 
     args = parser.parse_args()
     setup_logging(args.verbose)
@@ -120,7 +128,11 @@ Examples:
     video_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("YouTube ingest target: %s", video_dir)
-    download_youtube_assets(args.url, video_dir)
+    download_youtube_assets(
+        url=args.url,
+        video_dir=video_dir,
+        format_selector=args.ytdlp_format,
+    )
     prepare_standard_files(video_dir, metadata)
 
     logger.info("Prepared video directory: %s", video_dir)
@@ -183,11 +195,16 @@ def sanitize_name(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9._ -]+", "_", text).strip() or "item"
 
 
-def download_youtube_assets(url: str, video_dir: Path) -> None:
+def download_youtube_assets(
+    url: str,
+    video_dir: Path,
+    format_selector: str,
+) -> None:
     """Download video, subtitles, and info json into target folder."""
     cmd = [
         "yt-dlp",
         "--no-playlist",
+        "-f", format_selector,
         "--merge-output-format", "mp4",
         "--write-info-json",
         "--write-subs",
@@ -197,7 +214,7 @@ def download_youtube_assets(url: str, video_dir: Path) -> None:
         "-o", str(video_dir / "video.%(ext)s"),
         url,
     ]
-    logger.info("Downloading via yt-dlp ...")
+    logger.info("Downloading via yt-dlp (format=%s) ...", format_selector)
     run_checked(cmd, "yt-dlp download failed")
 
 

@@ -50,6 +50,10 @@ python run_youtube.py \
   --chunking-model llama3.2:latest
 ```
 
+By default, YouTube download uses highest quality format selection:
+
+- `--ytdlp-format "bv*+ba/b"` (best video + best audio, then fallback)
+
 Default output root:
 
 - `playlist_downloads/youtube_jobs/<video-title> [<video-id>]/`
@@ -96,6 +100,7 @@ Per video, outputs are written to:
 - `--stop-after <stage_name>` - stop pipeline after a specific stage
 - `--verbose` - enable debug logs
 - `--download-only` - download YouTube assets and stop before analysis
+- `--ytdlp-format "<selector>"` - override yt-dlp quality selector
 
 ## Notes
 
