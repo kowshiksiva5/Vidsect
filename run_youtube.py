@@ -7,7 +7,7 @@ This command adds a simple "one URL in, report out" layer:
 3) Run video_chunker pipeline
 
 Usage:
-  python -m video_chunker.run_youtube --url "https://www.youtube.com/watch?v=..."
+  python run_youtube.py --url "https://www.youtube.com/watch?v=..."
 """
 
 from __future__ import annotations
@@ -21,8 +21,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from video_chunker.config import PipelineConfig
-from video_chunker.orchestrator import run_pipeline
+from config import PipelineConfig
+from orchestrator import run_pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -46,13 +46,13 @@ def main() -> None:
         epilog="""
 Examples:
   # One-shot ingest + pipeline run
-  python -m video_chunker.run_youtube --url "https://www.youtube.com/watch?v=abc123"
+  python run_youtube.py --url "https://www.youtube.com/watch?v=abc123"
 
   # Save under a specific output root
-  python -m video_chunker.run_youtube --url "..." --output-root playlist_downloads/youtube_jobs
+  python run_youtube.py --url "..." --output-root playlist_downloads/youtube_jobs
 
   # Skip denoise and use local chunking model
-  python -m video_chunker.run_youtube --url "..." --skip stage0_denoise --chunking-model llama3.2:latest
+  python run_youtube.py --url "..." --skip stage0_denoise --chunking-model llama3.2:latest
         """,
     )
     parser.add_argument("--url", required=True, help="YouTube video URL")

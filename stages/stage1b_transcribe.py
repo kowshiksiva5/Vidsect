@@ -13,7 +13,7 @@ import logging
 import time
 from pathlib import Path
 
-from video_chunker.config import VideoContext
+from config import VideoContext
 
 logger = logging.getLogger(__name__)
 

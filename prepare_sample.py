@@ -9,7 +9,7 @@ Creates a self-contained sample directory with:
   - Copied metadata.json (with updated paths)
 
 Usage:
-    python -m video_chunker.prepare_sample \
+    python prepare_sample.py \
         --source-dir "playlist_downloads/.../01 - ..." \
         --start 0 --duration 3600 \
         --output-dir sample_1h
@@ -227,7 +227,7 @@ def prepare_sample(
     print(f"  ✓ Metadata written\n")
 
     print("Sample ready. Run the pipeline with:")
-    print(f"  python -m video_chunker.run --video-dir {output_dir}")
+    print(f"  python run.py --video-dir {output_dir}")
     return output_dir
 
 

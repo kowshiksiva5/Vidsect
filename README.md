@@ -10,10 +10,11 @@ Local-first pipeline to ingest YouTube videos and generate structured chunk repo
 
 ## Repository Layout
 
-- `video_chunker/` - main pipeline code
-- `video_chunker/run_youtube.py` - top-level YouTube URL -> full report
-- `video_chunker/run.py` - run pipeline on an existing local video directory
-- `video_chunker/prepare_sample.py` - create a 1-hour sample dataset
+- `run_youtube.py` - top-level YouTube URL -> full report
+- `run.py` - run pipeline on an existing local video directory
+- `prepare_sample.py` - create a 1-hour sample dataset
+- `stages/` - pipeline stage implementations
+- `utils/` - VTT parsing and helper utilities
 
 ## Prerequisites
 
@@ -43,7 +44,7 @@ export HF_TOKEN="your_huggingface_token"
 ## Run: One YouTube URL (recommended)
 
 ```bash
-python -m video_chunker.run_youtube \
+python run_youtube.py \
   --url "https://www.youtube.com/watch?v=PNTCM7cbrsc" \
   --skip stage0_denoise \
   --chunking-model llama3.2:latest
@@ -65,7 +66,7 @@ Your folder should contain:
 Run:
 
 ```bash
-python -m video_chunker.run --video-dir /path/to/video_dir
+python run.py --video-dir /path/to/video_dir
 ```
 
 ## Output Structure
@@ -101,4 +102,3 @@ Per video, outputs are written to:
 - If `HF_TOKEN` is missing, diarization falls back to a single-speaker timeline.
 - If `norfair` is unavailable, Stage 5 uses an embedding-only tracking fallback.
 - If Ollama/model is unavailable, chunking/summaries fall back gracefully.
-

@@ -12,8 +12,8 @@ import logging
 import time
 from pathlib import Path
 
-from video_chunker.config import PipelineConfig, VideoContext
-from video_chunker.stages import (
+from config import PipelineConfig, VideoContext
+from stages import (
     stage0_denoise,
     stage1_vtt_cleanup,
     stage1b_transcribe,

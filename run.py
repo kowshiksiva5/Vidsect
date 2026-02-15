@@ -3,13 +3,13 @@ CLI entry point for the video chunking pipeline.
 
 Usage:
     # Full pipeline on a video directory
-    python -m video_chunker.run --video-dir sample_1h/
+    python run.py --video-dir sample_1h/
 
     # Stop after a specific stage
-    python -m video_chunker.run --video-dir sample_1h/ --stop-after stage2_merge
+    python run.py --video-dir sample_1h/ --stop-after stage2_merge
 
     # Skip denoising (if audio already clean)
-    python -m video_chunker.run --video-dir sample_1h/ --skip stage0_denoise
+    python run.py --video-dir sample_1h/ --skip stage0_denoise
 """
 
 from __future__ import annotations
@@ -19,8 +19,8 @@ import logging
 import sys
 from pathlib import Path
 
-from video_chunker.config import PipelineConfig
-from video_chunker.orchestrator import run_pipeline
+from config import PipelineConfig
+from orchestrator import run_pipeline
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -44,16 +44,16 @@ def main() -> None:
         epilog="""
 Examples:
   # Full pipeline
-  python -m video_chunker.run --video-dir sample_1h/
+  python run.py --video-dir sample_1h/
 
   # Test early stages only
-  python -m video_chunker.run --video-dir sample_1h/ --stop-after stage2_merge
+  python run.py --video-dir sample_1h/ --stop-after stage2_merge
 
   # Skip denoising
-  python -m video_chunker.run --video-dir sample_1h/ --skip stage0_denoise
+  python run.py --video-dir sample_1h/ --skip stage0_denoise
 
   # Debug mode
-  python -m video_chunker.run --video-dir sample_1h/ --verbose
+  python run.py --video-dir sample_1h/ --verbose
         """,
     )
     parser.add_argument(

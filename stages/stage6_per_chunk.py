@@ -18,9 +18,9 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from video_chunker.config import VideoContext
-from video_chunker.stages.stage2_merge import slice_transcript
-from video_chunker.utils.vtt_parser import VTTCue, assess_vtt_quality
+from config import VideoContext
+from stages.stage2_merge import slice_transcript
+from utils.vtt_parser import VTTCue, assess_vtt_quality
 
 logger = logging.getLogger(__name__)
 

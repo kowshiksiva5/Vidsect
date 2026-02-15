@@ -12,8 +12,8 @@ import logging
 import time
 from pathlib import Path
 
-from video_chunker.config import VideoContext
-from video_chunker.utils.vtt_parser import VTTCue, parse_vtt, assess_vtt_quality
+from config import VideoContext
+from utils.vtt_parser import VTTCue, parse_vtt, assess_vtt_quality
 
 logger = logging.getLogger(__name__)
 
