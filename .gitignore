@@ -1,0 +1,35 @@
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Large media artifacts
+*.mp4
+*.wav
+*.zip
+*.mkv
+*.mov
+*.webm
+*.mp3
+
+# Pipeline/output data
+playlist_downloads/
+sample_1h/
+analysis/
+**/analysis/
+**/_denoise_tmp/
+
+# Local environment files
+.env
+.env.*
+

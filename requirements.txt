@@ -1,0 +1,16 @@
+# Core pipeline dependencies
+numpy
+scikit-learn
+mlx-whisper
+pyannote.audio
+torch
+scenedetect
+opencv-python
+insightface
+onnxruntime
+norfair
+ollama
+yt-dlp
+
+# Optional: enables Stage 0 denoising via `deep-filter` CLI.
+deepfilternet
