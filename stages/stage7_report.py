@@ -19,6 +19,83 @@ logger = logging.getLogger(__name__)
 STAGE_NAME = "stage7_report"
 
 
+_US_STATE_BY_ABBREV: dict[str, str] = {
+    "AL": "Alabama",
+    "AK": "Alaska",
+    "AZ": "Arizona",
+    "AR": "Arkansas",
+    "CA": "California",
+    "CO": "Colorado",
+    "CT": "Connecticut",
+    "DE": "Delaware",
+    "FL": "Florida",
+    "GA": "Georgia",
+    "HI": "Hawaii",
+    "ID": "Idaho",
+    "IL": "Illinois",
+    "IN": "Indiana",
+    "IA": "Iowa",
+    "KS": "Kansas",
+    "KY": "Kentucky",
+    "LA": "Louisiana",
+    "ME": "Maine",
+    "MD": "Maryland",
+    "MA": "Massachusetts",
+    "MI": "Michigan",
+    "MN": "Minnesota",
+    "MS": "Mississippi",
+    "MO": "Missouri",
+    "MT": "Montana",
+    "NE": "Nebraska",
+    "NV": "Nevada",
+    "NH": "New Hampshire",
+    "NJ": "New Jersey",
+    "NM": "New Mexico",
+    "NY": "New York",
+    "NC": "North Carolina",
+    "ND": "North Dakota",
+    "OH": "Ohio",
+    "OK": "Oklahoma",
+    "OR": "Oregon",
+    "PA": "Pennsylvania",
+    "RI": "Rhode Island",
+    "SC": "South Carolina",
+    "SD": "South Dakota",
+    "TN": "Tennessee",
+    "TX": "Texas",
+    "UT": "Utah",
+    "VT": "Vermont",
+    "VA": "Virginia",
+    "WA": "Washington",
+    "WV": "West Virginia",
+    "WI": "Wisconsin",
+    "WY": "Wyoming",
+    "DC": "District of Columbia",
+}
+
+_US_STATE_LOOKUP: dict[str, str] = {
+    name.lower(): name for name in _US_STATE_BY_ABBREV.values()
+}
+_US_STATE_LOOKUP.update({
+    abbr.lower(): name for abbr, name in _US_STATE_BY_ABBREV.items()
+})
+_US_STATE_LOOKUP.update({
+    "d.c": "District of Columbia",
+    "washington dc": "District of Columbia",
+    "washington d.c": "District of Columbia",
+})
+
+_CITY_STATE_PATTERN = re.compile(
+    r"\b([A-Z][A-Za-z'.-]+(?:\s+[A-Z][A-Za-z'.-]+){0,2}),\s*"
+    r"([A-Z]{2}|[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)\b"
+)
+
+_CITY_BLACKLIST = {
+    "i", "you", "we", "they", "he", "she", "it", "this", "that",
+    "stream", "ride", "chunk", "tour", "day", "live",
+}
+
+
 def run(ctx: VideoContext) -> VideoContext:
     """Assemble the final video analysis report."""
     if ctx.has_checkpoint(STAGE_NAME):
@@ -136,10 +213,11 @@ def _assemble_report(ctx: VideoContext) -> dict:
 
 def _assemble_consolidated_chunk_json(ctx: VideoContext) -> dict:
     """Single JSON with chunk timeline, summaries, speakers, faces, and text."""
+    metadata: dict = {}
     metadata_title = None
     if ctx.metadata_path and ctx.metadata_path.exists():
-        meta = json.loads(ctx.metadata_path.read_text())
-        metadata_title = meta.get("title") or meta.get("fulltitle")
+        metadata = json.loads(ctx.metadata_path.read_text())
+        metadata_title = metadata.get("title") or metadata.get("fulltitle")
 
     face_gallery = ctx.face_gallery or {}
     chunks_dir = ctx.debug_dir / "chunks"
@@ -165,6 +243,8 @@ def _assemble_consolidated_chunk_json(ctx: VideoContext) -> dict:
                 summary_text=summary_text or "",
                 transcript_text=full_text,
                 metadata_title=metadata_title or "",
+                metadata=metadata,
+                video_dir_name=ctx.video_dir.name,
             )
 
             chunk_entry = {
@@ -274,34 +354,116 @@ def _extract_location_mentions(
     summary_text: str,
     transcript_text: str,
     metadata_title: str,
+    metadata: dict | None = None,
+    video_dir_name: str = "",
 ) -> list[str]:
-    """Best-effort location mentions from title/summary/transcript text."""
-    texts = " ".join([title, summary_text, transcript_text[:2000], metadata_title])
-    mentions: set[str] = set()
-    trailing_words = {
-        "in", "at", "near", "from", "to", "around", "towards", "into", "on",
-    }
+    """
+    Precision-first location extraction.
 
-    patterns = [
-        r"\b(?:in|at|near|from|to|around|towards)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})",
-        r"\b([A-Z][a-z]+,\s*(?:California|Texas|Arizona|Nevada|New York|Florida))\b",
-    ]
-    for pat in patterns:
-        for match in re.findall(pat, texts):
-            m = match.strip()
-            words = m.split()
-            while words and words[-1].lower() in trailing_words:
-                words.pop()
-            m = " ".join(words).strip(", ")
-            if len(m) < 3:
-                continue
-            if m.lower() in {"stream", "ride", "chunk"}:
-                continue
-            if re.search(r"[^A-Za-z,\s-]", m):
-                continue
-            mentions.add(m)
+    Strategy:
+    1) Structured metadata/location fields (highest confidence)
+    2) Title-like strings (chunk title, metadata title, video directory name)
+    3) Summary/transcript fallback only if nothing high-confidence was found
+    """
+    metadata = metadata or {}
+    ordered: list[str] = []
+    seen: set[str] = set()
 
-    return sorted(mentions)
+    def add_mentions(text: str) -> None:
+        for loc in _extract_city_state_mentions(text):
+            key = loc.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(loc)
+
+    high_conf_texts = _structured_location_texts(metadata)
+    high_conf_texts.extend([title, metadata_title, video_dir_name])
+    for text in high_conf_texts:
+        add_mentions(text)
+
+    if ordered:
+        return ordered
+
+    add_mentions(summary_text)
+    add_mentions(transcript_text[:4000])
+    return ordered
+
+
+def _structured_location_texts(metadata: dict) -> list[str]:
+    """Collect likely location-bearing metadata fields."""
+    texts: list[str] = []
+
+    for key in ("location_from_title", "location", "city_state"):
+        val = metadata.get(key)
+        if isinstance(val, str) and val.strip():
+            texts.append(val.strip())
+
+    location_obj = metadata.get("location")
+    if isinstance(location_obj, dict):
+        raw = location_obj.get("raw")
+        city = location_obj.get("city")
+        region = location_obj.get("region") or location_obj.get("state")
+        if isinstance(raw, str) and raw.strip():
+            texts.append(raw.strip())
+        if isinstance(city, str) and isinstance(region, str):
+            texts.append(f"{city.strip()}, {region.strip()}")
+
+    city = metadata.get("city")
+    region = metadata.get("region") or metadata.get("state")
+    if isinstance(city, str) and isinstance(region, str):
+        texts.append(f"{city.strip()}, {region.strip()}")
+
+    return texts
+
+
+def _extract_city_state_mentions(text: str) -> list[str]:
+    """Extract strict City, State mentions and normalize state names."""
+    if not text:
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+
+    for city_raw, state_raw in _CITY_STATE_PATTERN.findall(text):
+        city = _clean_city(city_raw)
+        state = _normalize_state(state_raw)
+        if not city or not state:
+            continue
+        candidate = f"{city}, {state}"
+        key = candidate.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(candidate)
+
+    return out
+
+
+def _clean_city(city: str) -> str | None:
+    """Validate and normalize city name fragment."""
+    city = re.sub(r"\s+", " ", city).strip(" ,.-")
+    if len(city) < 3:
+        return None
+    if any(ch.isdigit() for ch in city):
+        return None
+    if not re.fullmatch(r"[A-Za-z'. -]+", city):
+        return None
+
+    words = [w for w in city.split() if w]
+    if not words:
+        return None
+    if words[0].lower() in _CITY_BLACKLIST:
+        return None
+    if all(w.lower() in _CITY_BLACKLIST for w in words):
+        return None
+    return city
+
+
+def _normalize_state(state: str) -> str | None:
+    """Normalize state full name/abbreviation to canonical full name."""
+    key = re.sub(r"[.]", "", state).strip().lower()
+    return _US_STATE_LOOKUP.get(key)
 
 
 def _format_hms(seconds: float) -> str:
