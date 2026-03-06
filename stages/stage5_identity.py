@@ -70,6 +70,7 @@ def run(ctx: VideoContext) -> VideoContext:
     speaker_mapping = _infer_names(
         speaker_mapping=speaker_mapping,
         transcript=ctx.merged_transcript,
+        model=ctx.config.chunking_model,
     )
 
     # Export representative face crops for each person ID.
@@ -211,89 +212,130 @@ def _build_face_tracks(ctx: VideoContext) -> list[dict]:
 
     det_threshold = ctx.config.face_det_threshold
 
-    # Process frames sequentially with Norfair tracking
+    # Multi-threaded batching approach for speedup.
+    # Video reading is done by a thread, sending batches of frames to be processed by InsightFace.
+    # InsightFace CPU scaling isn't great, but if we have CUDA/MPS it scales slightly better or we just offload IO.
+    import queue
+    import threading
+
     raw_tracks: dict[int, list[dict]] = {}  # track_id → detections
     track_embeddings: dict[int, list] = {}  # track_id → [embeddings]
-    frame_idx = 0
     sampled_count = 0
 
     t_start = time.time()
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    frame_queue = queue.Queue(maxsize=128)
+    stop_event = threading.Event()
 
-        if frame_idx % frame_interval != 0:
-            frame_idx += 1
-            continue
+    def frame_reader():
+        f_idx = 0
+        try:
+            while not stop_event.is_set():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if f_idx % frame_interval == 0:
+                    # Put with timeout so we can periodically check stop_event if queue is full
+                    while not stop_event.is_set():
+                        try:
+                            frame_queue.put((f_idx, frame), timeout=0.5)
+                            break
+                        except queue.Full:
+                            continue
+                f_idx += 1
+        finally:
+            # If we reached EOF naturally, we MUST push the sentinel to unblock the main thread.
+            if not stop_event.is_set():
+                while not stop_event.is_set():
+                    try:
+                        frame_queue.put(None, timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
+            cap.release()
 
-        timestamp = frame_idx / fps
-        sampled_count += 1
+    reader_thread = threading.Thread(target=frame_reader, daemon=True)
+    reader_thread.start()
 
-        # Resize for detection consistency + speed
-        frame_resized = cv2.resize(frame, (640, 360))
+    try:
+        while True:
+            item = frame_queue.get()
+            if item is None:
+                break
 
-        faces = app.get(frame_resized)
+            f_idx, frame = item
+            timestamp = f_idx / fps
+            sampled_count += 1
 
-        # Convert InsightFace detections to Norfair format
-        norfair_dets = []
-        face_extras = {}  # id(det) → metadata dict
+            # Resize for detection consistency + speed
+            frame_resized = cv2.resize(frame, (640, 360))
 
-        for face in faces:
-            if face.det_score < det_threshold:
-                continue
+            faces = app.get(frame_resized)
 
-            bbox = face.bbox.astype(int)
-            center = np.array(
-                [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2]
-            )
-            det = norfair.Detection(points=center.reshape(1, 2))
+            # Convert InsightFace detections to Norfair format
+            norfair_dets = []
+            face_extras = {}  # id(det) → metadata dict
 
-            # Store metadata keyed by detection object id
-            face_extras[id(det)] = {
-                "embedding": face.embedding,
-                "det_score": float(face.det_score),
-                "bbox": bbox.tolist(),
-                "timestamp": timestamp,
-            }
-            norfair_dets.append(det)
+            for face in faces:
+                if face.det_score < det_threshold:
+                    continue
 
-        # Update Norfair tracker — links detections to existing tracks
-        tracked_objects = tracker.update(detections=norfair_dets)
+                bbox = face.bbox.astype(int)
+                center = np.array(
+                    [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2]
+                )
+                det = norfair.Detection(points=center.reshape(1, 2))
 
-        for obj in tracked_objects:
-            last_det = obj.last_detection
-            if last_det is None:
-                continue
+                # Store metadata keyed by detection object id
+                face_extras[id(det)] = {
+                    "embedding": face.embedding,
+                    "det_score": float(face.det_score),
+                    "bbox": bbox.tolist(),
+                    "timestamp": timestamp,
+                }
+                norfair_dets.append(det)
 
-            extra = face_extras.get(id(last_det))
-            if extra is None:
-                continue
+            # Update Norfair tracker — links detections to existing tracks
+            tracked_objects = tracker.update(detections=norfair_dets)
 
-            tid = obj.id
-            if tid not in raw_tracks:
-                raw_tracks[tid] = []
-                track_embeddings[tid] = []
+            for obj in tracked_objects:
+                last_det = obj.last_detection
+                if last_det is None:
+                    continue
 
-            raw_tracks[tid].append({
-                "timestamp": extra["timestamp"],
-                "bbox": extra["bbox"],
-                "det_score": extra["det_score"],
-            })
-            track_embeddings[tid].append(extra["embedding"])
+                extra = face_extras.get(id(last_det))
+                if extra is None:
+                    continue
 
-        if sampled_count % 120 == 0:
-            elapsed = time.time() - t_start
-            logger.info(
-                f"    Processed {sampled_count}/{expected_frames} frames "
-                f"({elapsed:.1f}s, "
-                f"{len(raw_tracks)} tracks so far)"
-            )
+                tid = obj.id
+                if tid not in raw_tracks:
+                    raw_tracks[tid] = []
+                    track_embeddings[tid] = []
 
-        frame_idx += 1
+                raw_tracks[tid].append({
+                    "timestamp": extra["timestamp"],
+                    "bbox": extra["bbox"],
+                    "det_score": extra["det_score"],
+                })
+                track_embeddings[tid].append(extra["embedding"])
 
-    cap.release()
+            if sampled_count % 120 == 0:
+                elapsed = time.time() - t_start
+                logger.info(
+                    f"    Processed {sampled_count}/{expected_frames} frames "
+                    f"({elapsed:.1f}s, "
+                    f"{len(raw_tracks)} tracks so far)"
+                )
+    finally:
+        stop_event.set()
+        # Drain the queue if an exception occurred to unblock the reader thread
+        while not frame_queue.empty():
+            try:
+                frame_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    reader_thread.join(timeout=2.0)
 
     elapsed = time.time() - t_start
     logger.info(
@@ -591,18 +633,84 @@ def _empty_speaker_mapping(speaker_segments: list[dict]) -> dict:
 # 5d: Name inference
 # ---------------------------------------------------------------------------
 
+import json
+import re
+
 def _infer_names(
     speaker_mapping: dict,
     transcript: list[dict],
+    model: str,
 ) -> dict:
     """
-    Infer person names from transcript using regex patterns.
-
-    Looks for self-introductions: "I'm Mike", "my name is Sarah", etc.
+    Infer person names from transcript using LLM (if available) with regex fallback.
     """
-    import re
     logger.info("  5d: Name inference from transcript ...")
 
+    # Only process speakers we care about
+    speakers_to_name = {
+        spk: info for spk, info in speaker_mapping.items()
+        if info["confidence"] < 0.9 and info["display_name"] == spk
+    }
+
+    if not speakers_to_name:
+        return speaker_mapping
+
+    # Gather relevant transcript lines for these speakers
+    transcript_lines = []
+    for seg in transcript:
+        spk = seg.get("speaker")
+        text = seg.get("text", "").strip()
+        if spk in speakers_to_name and len(text) > 5:
+            transcript_lines.append(f"[{spk}]: {text}")
+
+    # Limit transcript size for the LLM
+    transcript_sample = "\n".join(transcript_lines[:300])
+
+    if transcript_sample:
+        prompt = (
+            "You are a helpful assistant analyzing a video transcript. "
+            "Your task is to identify the names of the speakers based on their dialogue.\n\n"
+            "Here is the transcript:\n"
+            f"{transcript_sample}\n\n"
+            "Identify the names for these speakers if possible: "
+            f"{', '.join(speakers_to_name.keys())}.\n"
+            "Respond ONLY with a JSON object mapping speaker IDs to their guessed names. "
+            "If you cannot confidently determine a name, do not include it in the JSON.\n"
+            "Example format: {\"SPEAKER_00\": \"Mike\", \"SPEAKER_01\": \"Sarah\"}"
+        )
+
+        try:
+            import ollama
+
+            logger.info(f"    Calling LLM ({model}) for name inference...")
+
+            # Attempt inference
+            response = ollama.chat(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                options={"temperature": 0.1, "num_predict": 512},
+            )
+
+            text = response["message"]["content"]
+            # Extract JSON
+            text = re.sub(r"```json\s*", "", text)
+            text = re.sub(r"```\s*", "", text)
+            match = re.search(r"\{.*\}", text, re.DOTALL)
+
+            if match:
+                guessed_names = json.loads(match.group(0))
+                for spk, name in guessed_names.items():
+                    if spk in speaker_mapping and isinstance(name, str) and len(name) > 1:
+                        current = speaker_mapping[spk]
+                        current["display_name"] = name
+                        current["confidence"] = max(current["confidence"], 0.7)
+                        current["method"] = current.get("method", "") + "+llm_name"
+                        logger.info(f"    LLM found name '{name}' for {spk}")
+
+        except Exception as exc:
+            logger.warning(f"    LLM name inference failed or not available: {exc}. Falling back to regex.")
+
+    # Fallback / augment with Regex
     name_patterns = [
         r"(?:I'm|I am|my name is|they call me|call me)\s+([A-Z][a-z]+)",
         r"(?:thanks|thank you),?\s+([A-Z][a-z]+)",
@@ -614,16 +722,19 @@ def _infer_names(
         if not spk or spk not in speaker_mapping:
             continue
 
+        current = speaker_mapping[spk]
+        if current["display_name"] != spk: # Already found a name
+            continue
+
         text = seg.get("text", "")
         for pattern in name_patterns:
             match = re.search(pattern, text)
             if match:
                 name = match.group(1)
-                current = speaker_mapping[spk]
-                if current["confidence"] < 0.8:
-                    current["display_name"] = name
-                    current["confidence"] = max(current["confidence"], 0.5)
-                    logger.info(f"    Found name '{name}' for {spk}")
+                current["display_name"] = name
+                current["confidence"] = max(current["confidence"], 0.5)
+                current["method"] = current.get("method", "") + "+regex_name"
+                logger.info(f"    Regex found name '{name}' for {spk}")
                 break
 
     return speaker_mapping
@@ -665,36 +776,80 @@ def _fallback_embedding_tracker(ctx: VideoContext) -> list[dict]:
     if not frame_times:
         return []
 
-    # Batch extract + detect via OpenCV
+    # Batch extract + detect via OpenCV (threaded)
     cap = cv2.VideoCapture(str(ctx.video_path))
     if not cap.isOpened():
         return []
+
+    import queue
+    import threading
 
     det_threshold = ctx.config.face_det_threshold
     track_threshold = ctx.config.face_embedding_distance_threshold
     detections: list[dict] = []
 
-    for i, t in enumerate(frame_times, start=1):
-        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            continue
+    frame_queue = queue.Queue(maxsize=128)
+    stop_event = threading.Event()
 
-        frame_resized = cv2.resize(frame, (640, 360))
-        faces = app.get(frame_resized)
-        for face in faces:
-            if face.det_score < det_threshold:
-                continue
-            detections.append({
-                "timestamp": t,
-                "bbox": face.bbox.tolist(),
-                "embedding": face.embedding,
-                "det_score": float(face.det_score),
-            })
-        if i % 120 == 0:
-            logger.info(f"    Processed {i}/{len(frame_times)} frames")
+    def fallback_reader():
+        try:
+            for t in frame_times:
+                if stop_event.is_set():
+                    break
+                cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    while not stop_event.is_set():
+                        try:
+                            frame_queue.put((t, frame), timeout=0.5)
+                            break
+                        except queue.Full:
+                            continue
+        finally:
+            if not stop_event.is_set():
+                while not stop_event.is_set():
+                    try:
+                        frame_queue.put(None, timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
+            cap.release()
 
-    cap.release()
+    reader_thread = threading.Thread(target=fallback_reader, daemon=True)
+    reader_thread.start()
+
+    i = 0
+    try:
+        while True:
+            item = frame_queue.get()
+            if item is None:
+                break
+
+            t, frame = item
+            i += 1
+
+            frame_resized = cv2.resize(frame, (640, 360))
+            faces = app.get(frame_resized)
+            for face in faces:
+                if face.det_score < det_threshold:
+                    continue
+                detections.append({
+                    "timestamp": t,
+                    "bbox": face.bbox.tolist(),
+                    "embedding": face.embedding,
+                    "det_score": float(face.det_score),
+                })
+            if i % 120 == 0:
+                logger.info(f"    Processed {i}/{len(frame_times)} frames")
+    finally:
+        stop_event.set()
+        while not frame_queue.empty():
+            try:
+                frame_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    reader_thread.join(timeout=2.0)
     logger.info(f"    {len(detections)} detections from {len(frame_times)} frames")
 
     # Group by embedding similarity (incremental mean)
