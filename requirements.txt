@@ -1,6 +1,7 @@
 # Core pipeline dependencies
 numpy
 scikit-learn
+scipy
 mlx-whisper
 pyannote.audio
 torch

@@ -53,7 +53,7 @@ def run(ctx: VideoContext) -> VideoContext:
     t0 = time.time()
 
     # 5a: Face detection + continuous Norfair tracking
-    face_tracks = _build_face_tracks(ctx)
+    face_tracks = _build_face_tracks(ctx, ctx.scene_boundaries or [])
 
     # 5b: DBSCAN clustering on track-level mean embeddings
     persons = _cluster_face_tracks(face_tracks, ctx)
@@ -80,11 +80,24 @@ def run(ctx: VideoContext) -> VideoContext:
         faces_root=ctx.analysis_dir / "faces",
     )
 
-    # Build face gallery for output
-    face_gallery = _build_face_gallery(persons, face_exports)
-
     # Build person identities dict
     person_identities = _build_person_identities(persons)
+
+    # Propagate inferred names back to person identities
+    for spk, mapping in speaker_mapping.items():
+        if mapping.get("person_id") and mapping.get("display_name") and mapping["display_name"] != spk:
+            pid = mapping["person_id"]
+            if pid in person_identities:
+                # Set the display name to the inferred name, preferring the most confident one
+                # if multiple speakers map to the same person (unlikely with global matching, but safe).
+                current_conf = person_identities[pid].get("confidence", 0)
+                if mapping["confidence"] >= current_conf:
+                    person_identities[pid]["display_name"] = mapping["display_name"]
+                    person_identities[pid]["confidence"] = mapping["confidence"]
+                    person_identities[pid]["source"] = "speaker_mapping"
+
+    # Build face gallery for output
+    face_gallery = _build_face_gallery(persons, face_exports)
 
     # Store results
     ctx.face_gallery = face_gallery
@@ -113,9 +126,10 @@ def run(ctx: VideoContext) -> VideoContext:
 # 5a: Face detection + continuous Norfair tracking
 # ---------------------------------------------------------------------------
 
-def _build_face_tracks(ctx: VideoContext) -> list[dict]:
+def _build_face_tracks(ctx: VideoContext, scene_boundaries: list[float]) -> list[dict]:
     """
     Detect faces with InsightFace, link them into continuous tracks via Norfair.
+    Scene-aware: resets the tracker at every camera cut to prevent false linkage.
 
     Uses OpenCV VideoCapture for batch frame reading (single video open).
     Norfair maintains tracker state across frames, linking detections into
@@ -148,7 +162,7 @@ def _build_face_tracks(ctx: VideoContext) -> list[dict]:
             "  norfair not installed — falling back to embedding-only tracker. "
             "Run: pip install norfair"
         )
-        return _fallback_embedding_tracker(ctx)
+        return _fallback_embedding_tracker(ctx, scene_boundaries)
 
     try:
         import cv2
@@ -174,13 +188,20 @@ def _build_face_tracks(ctx: VideoContext) -> list[dict]:
     app = FaceAnalysis(name="buffalo_l", providers=providers)
     app.prepare(ctx_id=0, det_size=(640, 640))
 
-    # Initialize Norfair tracker
-    tracker = norfair.Tracker(
-        distance_function="euclidean",
-        distance_threshold=ctx.config.face_track_distance_threshold,
-        hit_counter_max=15,      # Keep track alive for 15 missed frames
-        initialization_delay=2,  # Require 2 consecutive detections
-    )
+    # Initialize Norfair tracker factory function to reset easily
+    def _create_tracker() -> norfair.Tracker:
+        return norfair.Tracker(
+            distance_function="euclidean",
+            distance_threshold=ctx.config.face_track_distance_threshold,
+            hit_counter_max=15,      # Keep track alive for 15 missed frames
+            initialization_delay=2,  # Require 2 consecutive detections
+        )
+
+    tracker = _create_tracker()
+
+    # Create a quick-lookup for scene boundaries (sorted)
+    sorted_scenes = sorted(scene_boundaries)
+    current_scene_idx = 0
 
     # Open video
     cap = cv2.VideoCapture(str(ctx.video_path))
@@ -218,8 +239,8 @@ def _build_face_tracks(ctx: VideoContext) -> list[dict]:
     import queue
     import threading
 
-    raw_tracks: dict[int, list[dict]] = {}  # track_id → detections
-    track_embeddings: dict[int, list] = {}  # track_id → [embeddings]
+    raw_tracks: dict[str, list[dict]] = {}  # track_id → detections
+    track_embeddings: dict[str, list] = {}  # track_id → [embeddings]
     sampled_count = 0
 
     t_start = time.time()
@@ -267,65 +288,73 @@ def _build_face_tracks(ctx: VideoContext) -> list[dict]:
             timestamp = f_idx / fps
             sampled_count += 1
 
-            # Resize for detection consistency + speed
-            frame_resized = cv2.resize(frame, (640, 360))
+        # Check if we crossed a scene boundary
+        if current_scene_idx < len(sorted_scenes) and timestamp >= sorted_scenes[current_scene_idx]:
+            # Reset tracker to prevent false linkages across cuts
+            tracker = _create_tracker()
+            while current_scene_idx < len(sorted_scenes) and timestamp >= sorted_scenes[current_scene_idx]:
+                current_scene_idx += 1
 
-            faces = app.get(frame_resized)
+        # Resize for detection consistency + speed
+        frame_resized = cv2.resize(frame, (640, 360))
 
-            # Convert InsightFace detections to Norfair format
-            norfair_dets = []
-            face_extras = {}  # id(det) → metadata dict
+        faces = app.get(frame_resized)
 
-            for face in faces:
-                if face.det_score < det_threshold:
-                    continue
+        # Convert InsightFace detections to Norfair format
+        norfair_dets = []
+        face_extras = {}  # id(det) → metadata dict
 
-                bbox = face.bbox.astype(int)
-                center = np.array(
-                    [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2]
-                )
-                det = norfair.Detection(points=center.reshape(1, 2))
+        for face in faces:
+            if face.det_score < det_threshold:
+                continue
 
-                # Store metadata keyed by detection object id
-                face_extras[id(det)] = {
-                    "embedding": face.embedding,
-                    "det_score": float(face.det_score),
-                    "bbox": bbox.tolist(),
-                    "timestamp": timestamp,
-                }
-                norfair_dets.append(det)
+            bbox = face.bbox.astype(int)
+            center = np.array(
+                [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2]
+            )
+            det = norfair.Detection(points=center.reshape(1, 2))
 
-            # Update Norfair tracker — links detections to existing tracks
-            tracked_objects = tracker.update(detections=norfair_dets)
+            # Store metadata keyed by detection object id
+            face_extras[id(det)] = {
+                "embedding": face.embedding,
+                "det_score": float(face.det_score),
+                "bbox": bbox.tolist(),
+                "timestamp": timestamp,
+            }
+            norfair_dets.append(det)
 
-            for obj in tracked_objects:
-                last_det = obj.last_detection
-                if last_det is None:
-                    continue
+        # Update Norfair tracker — links detections to existing tracks
+        tracked_objects = tracker.update(detections=norfair_dets)
 
-                extra = face_extras.get(id(last_det))
-                if extra is None:
-                    continue
+        for obj in tracked_objects:
+            last_det = obj.last_detection
+            if last_det is None:
+                continue
 
-                tid = obj.id
-                if tid not in raw_tracks:
-                    raw_tracks[tid] = []
-                    track_embeddings[tid] = []
+            extra = face_extras.get(id(last_det))
+            if extra is None:
+                continue
 
-                raw_tracks[tid].append({
-                    "timestamp": extra["timestamp"],
-                    "bbox": extra["bbox"],
-                    "det_score": extra["det_score"],
-                })
-                track_embeddings[tid].append(extra["embedding"])
+            # Namespace track IDs by scene to prevent collisions when the tracker resets
+            tid = f"{current_scene_idx}_{obj.id}"
+            if tid not in raw_tracks:
+                raw_tracks[tid] = []
+                track_embeddings[tid] = []
 
-            if sampled_count % 120 == 0:
-                elapsed = time.time() - t_start
-                logger.info(
-                    f"    Processed {sampled_count}/{expected_frames} frames "
-                    f"({elapsed:.1f}s, "
-                    f"{len(raw_tracks)} tracks so far)"
-                )
+            raw_tracks[tid].append({
+                "timestamp": extra["timestamp"],
+                "bbox": extra["bbox"],
+                "det_score": extra["det_score"],
+            })
+            track_embeddings[tid].append(extra["embedding"])
+
+        if sampled_count % 120 == 0:
+            elapsed = time.time() - t_start
+            logger.info(
+                f"    Processed {sampled_count}/{expected_frames} frames "
+                f"({elapsed:.1f}s, "
+                f"{len(raw_tracks)} tracks so far)"
+            )
     finally:
         stop_event.set()
         # Drain the queue if an exception occurred to unblock the reader thread
@@ -538,79 +567,121 @@ def _build_speaker_face_fusion(
                 evidence[key]["ambiguous"] += 1
             speaker_stats[spk]["ambiguous"] += 1
 
-    # Step 4: Score each speaker → best person mapping
-    mapping: dict[str, dict] = {}
-    unique_speakers = set(speaker_at) - {None}
+    # Step 4: Build affinity matrix and solve global 1:1 mapping assignment
+    unique_speakers = sorted(list(set(speaker_at) - {None}))
+    person_ids = sorted(list(persons.keys()))
 
-    for spk in unique_speakers:
-        stats = speaker_stats.get(spk, {})
-        total_sec = stats.get("total", 0)
-        if total_sec < 10:
-            mapping[spk] = {
+    mapping: dict[str, dict] = {}
+
+    # Initialize affinity matrix (rows=speakers, cols=persons)
+    import numpy as np
+    from scipy.optimize import linear_sum_assignment
+
+    if not unique_speakers or not person_ids:
+        for spk in unique_speakers:
+             mapping[spk] = {
                 "person_id": None,
                 "display_name": spk,
                 "confidence": 0.0,
                 "method": "insufficient_data",
             }
-            continue
+        return mapping
 
-        # Score each candidate person for this speaker
-        candidates: list[tuple[str, float, dict]] = []
-        for (s, pid), ev in evidence.items():
-            if s != spk:
+    cost_matrix = np.ones((len(unique_speakers), len(person_ids))) * 1000.0  # High initial cost
+    affinity_matrix = np.zeros((len(unique_speakers), len(person_ids)))
+
+    for i, spk in enumerate(unique_speakers):
+        stats = speaker_stats.get(spk, {})
+        total_sec = stats.get("total", 0)
+
+        if total_sec < 10:
+            continue # Leave high cost, won't be confidently mapped
+
+        for j, pid in enumerate(person_ids):
+            ev = evidence.get((spk, pid))
+            if not ev:
                 continue
-            score = (
-                ev["exclusive"] + ev["ambiguous"] * AMBIGUOUS_WEIGHT
-            ) / total_sec
-            candidates.append((pid, score, ev))
 
-        candidates.sort(key=lambda x: x[1], reverse=True)
+            score = (ev["exclusive"] + ev["ambiguous"] * AMBIGUOUS_WEIGHT) / total_sec
+            affinity_matrix[i, j] = score
+            cost_matrix[i, j] = -score # We want to maximize affinity, so minimize -score
 
-        if not candidates:
-            off_pct = stats["off_camera"] / total_sec
-            mapping[spk] = {
+    # Solve the linear assignment problem
+    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+    for spk_idx, pid_idx in zip(row_ind, col_ind):
+        spk = unique_speakers[spk_idx]
+        pid = person_ids[pid_idx]
+        best_score = affinity_matrix[spk_idx, pid_idx]
+
+        stats = speaker_stats.get(spk, {})
+        total_sec = stats.get("total", 0)
+        ev = evidence.get((spk, pid), {"exclusive": 0, "ambiguous": 0})
+
+        # Calculate margin against the next best person for this speaker
+        other_scores = [affinity_matrix[spk_idx, k] for k in range(len(person_ids)) if k != pid_idx]
+        runner_up_score = max(other_scores) if other_scores else 0.0
+        margin = best_score - runner_up_score
+
+        if total_sec < 10:
+             mapping[spk] = {
                 "person_id": None,
                 "display_name": spk,
                 "confidence": 0.0,
-                "method": "off_camera_speaker",
-                "off_camera_pct": round(off_pct, 3),
+                "method": "insufficient_data",
             }
-            continue
-
-        best_pid, best_score, best_ev = candidates[0]
-        runner_up_score = candidates[1][1] if len(candidates) > 1 else 0.0
-        margin = best_score - runner_up_score
-
-        if best_score >= MIN_CONFIDENCE and margin >= MIN_MARGIN:
+        elif best_score >= MIN_CONFIDENCE and margin >= MIN_MARGIN:
             mapping[spk] = {
-                "person_id": best_pid,
-                "display_name": best_pid,
+                "person_id": pid,
+                "display_name": pid,
                 "confidence": round(best_score, 3),
                 "margin": round(margin, 3),
-                "exclusive_seconds": best_ev["exclusive"],
-                "ambiguous_seconds": best_ev["ambiguous"],
-                "off_camera_pct": round(
-                    stats["off_camera"] / total_sec, 3
-                ),
-                "method": "bin_fusion_exclusive",
+                "exclusive_seconds": ev["exclusive"],
+                "ambiguous_seconds": ev["ambiguous"],
+                "off_camera_pct": round(stats.get("off_camera", 0) / total_sec, 3),
+                "method": "global_bipartite_matching",
             }
         else:
-            mapping[spk] = {
-                "person_id": best_pid,
+            off_pct = stats.get("off_camera", 0) / max(total_sec, 1)
+            if off_pct > 0.6 and best_score < MIN_CONFIDENCE:
+                mapping[spk] = {
+                    "person_id": None,
+                    "display_name": spk,
+                    "confidence": 0.0,
+                    "method": "off_camera_speaker",
+                    "off_camera_pct": round(off_pct, 3),
+                }
+            else:
+                mapping[spk] = {
+                    "person_id": pid if best_score > 0 else None,
+                    "display_name": spk,
+                    "confidence": round(best_score, 3),
+                    "margin": round(margin, 3),
+                    "method": "NEEDS_HUMAN_VERIFICATION",
+                    "reason": f"score={best_score:.2f}, margin={margin:.2f}",
+                }
+
+    # Add any speakers that weren't assigned at all by the hungarian algorithm (e.g. more speakers than faces)
+    for spk in unique_speakers:
+        if spk not in mapping:
+             stats = speaker_stats.get(spk, {})
+             total_sec = stats.get("total", 0)
+             off_pct = stats.get("off_camera", 0) / max(total_sec, 1)
+             mapping[spk] = {
+                "person_id": None,
                 "display_name": spk,
-                "confidence": round(best_score, 3),
-                "margin": round(margin, 3),
-                "method": "NEEDS_HUMAN_VERIFICATION",
-                "reason": f"score={best_score:.2f}, margin={margin:.2f}",
+                "confidence": 0.0,
+                "method": "off_camera_speaker" if off_pct > 0.6 else "unmatched_speaker",
+                "off_camera_pct": round(off_pct, 3),
             }
 
     matched = sum(
         1 for m in mapping.values()
-        if m.get("method") == "bin_fusion_exclusive"
+        if m.get("method") == "global_bipartite_matching"
     )
     logger.info(
         f"    Mapped {matched}/{len(mapping)} speakers to faces "
-        f"(bin_fusion_exclusive)"
+        f"(global_bipartite_matching)"
     )
     return mapping
 
@@ -646,36 +717,61 @@ def _infer_names(
     """
     logger.info("  5d: Name inference from transcript ...")
 
-    # Only process speakers we care about
-    speakers_to_name = {
-        spk: info for spk, info in speaker_mapping.items()
-        if info["confidence"] < 0.9 and info["display_name"] == spk
-    }
+    # Only process speakers we care about.
+    # A speaker needs a name if their display name is still generic
+    # (e.g. "SPEAKER_00", "person_001", etc.)
+    speakers_to_name = {}
+    for spk, info in speaker_mapping.items():
+        # Confident mapping is about the speaker->face link, not the name.
+        # We always want names.
+        dname = info.get("display_name", "")
+        if dname == spk or str(dname).startswith("person_"):
+            speakers_to_name[spk] = info
 
     if not speakers_to_name:
         return speaker_mapping
 
-    # Gather relevant transcript lines for these speakers
-    transcript_lines = []
-    for seg in transcript:
-        spk = seg.get("speaker")
-        text = seg.get("text", "").strip()
-        if spk in speakers_to_name and len(text) > 5:
-            transcript_lines.append(f"[{spk}]: {text}")
+    # Saliency filter: find transcript lines that likely contain names
+    # to curate a highly relevant context window for the LLM.
+    saliency_keywords = [
+        "name", "call me", "i'm", "i am", "this is", "meet", "thanks", "thank you",
+        "hey", "hi ", "hello", "welcome", "guy", "girl", "man", "woman", "who"
+    ]
 
-    # Limit transcript size for the LLM
-    transcript_sample = "\n".join(transcript_lines[:300])
+    salient_indices = []
+    for i, seg in enumerate(transcript):
+        text = seg.get("text", "").lower()
+        if any(kw in text for kw in saliency_keywords):
+            salient_indices.append(i)
+
+    # Build curated transcript blocks (+/- 2 lines around salient lines)
+    curated_lines = []
+    added_indices = set()
+
+    for idx in salient_indices:
+        for j in range(max(0, idx - 2), min(len(transcript), idx + 3)):
+            if j not in added_indices:
+                seg = transcript[j]
+                spk = seg.get("speaker", "UNKNOWN")
+                text = seg.get("text", "").strip()
+                if text:
+                    curated_lines.append(f"[{spk}]: {text}")
+                added_indices.add(j)
+        curated_lines.append("---") # separator for blocks
+
+    # Limit total size to prevent context overflow (keep the best ~400 lines)
+    transcript_sample = "\n".join(curated_lines[:400])
 
     if transcript_sample:
         prompt = (
-            "You are a helpful assistant analyzing a video transcript. "
-            "Your task is to identify the names of the speakers based on their dialogue.\n\n"
-            "Here is the transcript:\n"
+            "You are a helpful assistant analyzing extracts from a video transcript. "
+            "Your task is to identify the real names of the speakers based on their dialogue.\n\n"
+            "Here are relevant excerpts from the transcript (separated by '---'):\n"
             f"{transcript_sample}\n\n"
-            "Identify the names for these speakers if possible: "
+            "Identify the names for these target speakers if possible: "
             f"{', '.join(speakers_to_name.keys())}.\n"
             "Respond ONLY with a JSON object mapping speaker IDs to their guessed names. "
-            "If you cannot confidently determine a name, do not include it in the JSON.\n"
+            "If you cannot confidently determine a name for a speaker, do not include that speaker in the JSON.\n"
             "Example format: {\"SPEAKER_00\": \"Mike\", \"SPEAKER_01\": \"Sarah\"}"
         )
 
@@ -723,8 +819,9 @@ def _infer_names(
             continue
 
         current = speaker_mapping[spk]
-        if current["display_name"] != spk: # Already found a name
-            continue
+        dname = current.get("display_name", "")
+        if dname != spk and not str(dname).startswith("person_"):
+            continue # Already found a real name (from LLM)
 
         text = seg.get("text", "")
         for pattern in name_patterns:
@@ -744,7 +841,7 @@ def _infer_names(
 # Fallback tracker (when Norfair is not installed)
 # ---------------------------------------------------------------------------
 
-def _fallback_embedding_tracker(ctx: VideoContext) -> list[dict]:
+def _fallback_embedding_tracker(ctx: VideoContext, scene_boundaries: list[float]) -> list[dict]:
     """
     Fallback: detect faces + group by embedding similarity.
 
@@ -852,12 +949,25 @@ def _fallback_embedding_tracker(ctx: VideoContext) -> list[dict]:
     reader_thread.join(timeout=2.0)
     logger.info(f"    {len(detections)} detections from {len(frame_times)} frames")
 
-    # Group by embedding similarity (incremental mean)
+    # Group by embedding similarity (incremental mean), respecting scene boundaries
     tracks: list[dict] = []
+    active_tracks: list[dict] = []
+
+    sorted_scenes = sorted(scene_boundaries)
+    current_scene_idx = 0
+
     for det in sorted(detections, key=lambda d: d["timestamp"]):
+        t = det["timestamp"]
+
+        # Reset active tracks if we cross a scene boundary
+        if current_scene_idx < len(sorted_scenes) and t >= sorted_scenes[current_scene_idx]:
+            active_tracks = []
+            while current_scene_idx < len(sorted_scenes) and t >= sorted_scenes[current_scene_idx]:
+                current_scene_idx += 1
+
         emb = np.array(det["embedding"])
         matched = False
-        for track in tracks:
+        for track in active_tracks:
             track_mean = track["_emb_sum"] / track["_emb_count"]
             distance = 1.0 - float(
                 np.dot(emb, track_mean)
@@ -875,7 +985,7 @@ def _fallback_embedding_tracker(ctx: VideoContext) -> list[dict]:
                 break
 
         if not matched:
-            tracks.append({
+            new_track = {
                 "track_id": len(tracks),
                 "detections": [{
                     "timestamp": det["timestamp"],
@@ -884,7 +994,9 @@ def _fallback_embedding_tracker(ctx: VideoContext) -> list[dict]:
                 }],
                 "_emb_sum": emb.copy(),
                 "_emb_count": 1,
-            })
+            }
+            tracks.append(new_track)
+            active_tracks.append(new_track)
 
     # Finalize
     result = []
