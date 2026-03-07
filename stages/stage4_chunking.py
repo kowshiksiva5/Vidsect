@@ -243,67 +243,90 @@ def _multi_pass_chunk(
     max_duration: float,
     actual_end: float,
 ) -> tuple[list[dict], bool]:
-    """Chunk long transcripts in overlapping windows."""
-    all_chunks: list[dict] = []
-    chunk_id_offset = 0
-    fallback_used = False
+    """Chunk long transcripts in overlapping windows using parallel LLM requests."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    for i in range(0, len(segments), window_size - 100):  # 100-segment overlap
+    windows = []
+    # Build windows with 100-segment overlap
+    for i in range(0, len(segments), window_size - 100):
         window = segments[i:i + window_size]
         if not window:
             break
-
         window_start = window[0]["start"]
         window_end = window[-1]["end"]
-
-        # Filter scene boundaries for this window
-        window_scenes = [
-            b for b in scene_boundaries
-            if window_start <= b <= window_end
-        ]
-
+        window_scenes = [b for b in scene_boundaries if window_start <= b <= window_end]
         text = _format_transcript_for_llm(window, window_scenes)
-        chunks, chunk_fallback = _single_pass_chunk(
-            text,
-            model,
-            fallback_start=window_start,
-            fallback_end=window_end,
-        )
-        fallback_used = fallback_used or chunk_fallback
+        windows.append((text, window_start, window_end))
 
-        # Re-number and add
-        for c in chunks:
-            c["chunk_id"] = chunk_id_offset + c["chunk_id"]
+    all_chunks_nested: list[list[dict]] = [[] for _ in windows]
+    fallback_used = False
+
+    def process_window(idx, w_text, w_start, w_end):
+        return idx, _single_pass_chunk(w_text, model, w_start, w_end)
+
+    # Process windows in parallel to speed up LLM generation
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(process_window, idx, w[0], w[1], w[2]): idx
+            for idx, w in enumerate(windows)
+        }
+        for future in as_completed(futures):
+            try:
+                idx, (chunks, is_fallback) = future.result()
+                all_chunks_nested[idx] = chunks
+                if is_fallback:
+                    fallback_used = True
+            except Exception as exc:
+                logger.warning(f"Window processing failed: {exc}")
+
+    # Flatten chunks in chronological order
+    all_chunks = []
+    for chunks in all_chunks_nested:
         all_chunks.extend(chunks)
-        chunk_id_offset += len(chunks)
 
-    # Deduplicate overlapping chunks
+    # Deduplicate overlapping chunks robustly
     return _deduplicate_chunks(all_chunks), fallback_used
 
 
 def _deduplicate_chunks(chunks: list[dict]) -> list[dict]:
-    """Remove overlapping chunks from multi-pass windowing."""
+    """
+    Robustly merge and deduplicate overlapping chunks from multi-pass windowing.
+    Rather than simply dropping chunks, we align their boundaries.
+    """
     if not chunks:
         return []
 
-    sorted_chunks = sorted(chunks, key=lambda c: c["start_sec"])
-    deduped = [sorted_chunks[0]]
+    # Sort chunks primarily by start time, then by duration (longer first)
+    sorted_chunks = sorted(chunks, key=lambda c: (c["start_sec"], -(c["end_sec"] - c["start_sec"])))
 
-    for chunk in sorted_chunks[1:]:
-        prev = deduped[-1]
-        # If this chunk starts within the previous one, skip it
-        if chunk["start_sec"] < prev["end_sec"] - 30:
+    merged_list = [sorted_chunks[0]]
+
+    for current in sorted_chunks[1:]:
+        prev = merged_list[-1]
+
+        # If the current chunk is completely contained within the previous one, drop it.
+        if current["start_sec"] >= prev["start_sec"] and current["end_sec"] <= prev["end_sec"]:
             continue
-        # Adjust start to avoid gap
-        if chunk["start_sec"] > prev["end_sec"]:
-            prev["end_sec"] = chunk["start_sec"]
-        deduped.append(chunk)
 
-    # Renumber
-    for i, c in enumerate(deduped, 1):
+        # If there is a significant overlap, but current extends beyond prev
+        if current["start_sec"] < prev["end_sec"] - 30:
+            # We take the midpoint of the overlap as the boundary
+            overlap_midpoint = (current["start_sec"] + prev["end_sec"]) / 2
+            prev["end_sec"] = overlap_midpoint
+            current["start_sec"] = overlap_midpoint
+            merged_list.append(current)
+        else:
+            # No significant overlap. Ensure contiguous boundary to prevent gaps.
+            if current["start_sec"] > prev["end_sec"]:
+                # Simply connect the previous end to current start
+                prev["end_sec"] = current["start_sec"]
+            merged_list.append(current)
+
+    # Renumber cleanly
+    for i, c in enumerate(merged_list, 1):
         c["chunk_id"] = i
 
-    return deduped
+    return merged_list
 
 
 def _parse_chunks_json(

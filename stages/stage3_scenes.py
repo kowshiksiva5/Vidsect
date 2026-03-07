@@ -53,24 +53,39 @@ def run(ctx: VideoContext) -> VideoContext:
 def _detect_scenes(video_path: Path) -> list[float]:
     """
     Run PySceneDetect content-aware detection.
+    Uses downscaling and an optimized pipeline for drastic speedups.
 
     Returns list of scene boundary timestamps in seconds.
     """
     try:
-        from scenedetect import detect, ContentDetector
+        from scenedetect import open_video, SceneManager
+        from scenedetect.detectors import ContentDetector
     except ImportError:
         raise ImportError(
             "scenedetect not installed. Run: pip install scenedetect[opencv]"
         )
 
-    logger.info("  Running ContentDetector ...")
-    scene_list = detect(
-        str(video_path),
-        ContentDetector(
-            threshold=27.0,  # Default, reasonable for IRL streams
-            min_scene_len=15,  # At least 15 frames (~0.5s at 30fps)
-        ),
-    )
+    logger.info("  Running optimized ContentDetector (downscaled) ...")
+
+    # Open the video using the modern v0.6+ API
+    video = open_video(str(video_path))
+    scene_manager = SceneManager()
+
+    # Add ContentDetector algorithm.
+    scene_manager.add_detector(ContentDetector(
+        threshold=27.0,
+        min_scene_len=15,
+    ))
+
+    # Improve processing speed by downscaling before processing.
+    # A typical video is 1080p, setting downscale_factor to 4 speeds up histogram comparisons significantly.
+    scene_manager.downscale = 4
+
+    # Perform scene detection.
+    scene_manager.detect_scenes(video=video)
+
+    # Obtain list of detected scenes.
+    scene_list = scene_manager.get_scene_list()
 
     # Convert FrameTimecode pairs to boundary seconds
     boundaries = []
